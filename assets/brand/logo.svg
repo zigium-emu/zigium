@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 196 48" role="img" aria-label="Zigium">
+  <rect x="1" y="1" width="46" height="46" rx="14" fill="#202724"/>
+  <path d="M12 14h24L21 32h15v6H11v-6l15-18H12z" fill="#ff9a47"/>
+  <circle cx="37" cy="12" r="4" fill="#a9ddc0"/>
+  <g fill="#202724">
+    <path d="M61 16h18v4L66 32h13v5H60v-4l13-12H61z"/>
+    <path d="M84 16h5v21h-5zm0-9h5v5h-5z"/>
+    <path fill-rule="evenodd" d="M110 16h5v20c0 7-4 10-11 10-3 0-6-1-8-2l2-4c2 1 4 2 6 2 4 0 6-2 6-6v-1c-2 2-4 3-7 3-6 0-10-4-10-11s4-12 10-12c3 0 5 1 7 3zm-6 4c-4 0-6 3-6 7s2 6 6 6 6-2 6-6-2-7-6-7z"/>
+    <path d="M121 16h5v13c0 3 1 4 4 4s5-2 5-5V16h5v21h-5v-3c-2 2-4 4-7 4-5 0-7-3-7-8z"/>
+    <path d="M145 16h5v21h-5zm0-9h5v5h-5z"/>
+    <path d="M156 16h5v3c1-2 4-4 7-4s5 1 6 4c2-3 4-4 7-4 5 0 8 3 8 8v14h-5V24c0-3-1-4-4-4s-5 2-5 5v12h-5V24c0-3-1-4-4-4s-5 2-5 5v12h-5z"/>
+  </g>
+</svg>

@@ -5,3 +5,5 @@ zig-out/
 *.ppm
 sdmc/
 nand/
+*.[mM][dD]
+!/[rR][eE][aA][dD][mM][eE].[mM][dD]

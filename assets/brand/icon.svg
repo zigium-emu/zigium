@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="Zigium">
+  <rect width="64" height="64" rx="18" fill="#202724"/>
+  <path d="M17 19h31L27 42h20v7H15v-7l21-23H17z" fill="#ff9a47"/>
+  <circle cx="49" cy="17" r="5" fill="#a9ddc0"/>
+</svg>
