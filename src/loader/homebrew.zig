@@ -3,7 +3,7 @@ const Memory = @import("../memory/address_space.zig").Memory;
 const Permissions = @import("../memory/address_space.zig").Permissions;
 
 pub const heap_base: u64 = 0x7200000000;
-pub const heap_size: usize = 16 * 1024 * 1024;
+pub const heap_size: usize = 64 * 1024 * 1024;
 pub const stack_base: u64 = 0x7300000000;
 pub const stack_size: usize = 1024 * 1024;
 pub const tls_base: u64 = 0x7400000000;

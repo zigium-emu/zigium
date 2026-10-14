@@ -188,3 +188,16 @@ test "NSO execute-only text allows instruction fetch and denies reads" {
     try std.testing.expectEqual(@as(u32, 0xd503201f), try memory.fetch(base));
     try std.testing.expectError(error.AccessDenied, memory.readInt(u32, base));
 }
+
+test "NSO corrupt LZ4 rolls back earlier segments and preserves unrelated mappings" {
+    var bytes = fixture(true);
+    const ro_offset = integer(u32, &bytes, 0x20);
+    bytes[ro_offset] = 0x10;
+    var memory = Memory.init(std.testing.allocator);
+    defer memory.deinit();
+    try memory.map(0x1000, 0x1000, .{ .read = true, .write = true });
+    try memory.writeInt(u32, 0x1000, 0x55);
+    try std.testing.expectError(error.InvalidLz4Offset, load(&memory, &bytes));
+    try std.testing.expectEqual(@as(usize, 0x1000), memory.mapped_bytes);
+    try std.testing.expectEqual(@as(u32, 0x55), try memory.readInt(u32, 0x1000));
+}
