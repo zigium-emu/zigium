@@ -139,12 +139,29 @@ pub const Memory = struct {
     }
 
     pub fn readInt(self: *const Memory, comptime T: type, address: u64) !T {
+        if (self.regionAt(address)) |index| {
+            const region = self.regions.items[index];
+            const offset: usize = @intCast(address - region.base);
+            if (@sizeOf(T) <= region.bytes.len - offset) {
+                if (!region.permissions.read) return error.AccessDenied;
+                return std.mem.readInt(T, region.bytes[offset..][0..@sizeOf(T)], .little);
+            }
+        }
         var bytes: [@sizeOf(T)]u8 = undefined;
         try self.read(address, &bytes);
         return std.mem.readInt(T, &bytes, .little);
     }
 
     pub fn writeInt(self: *Memory, comptime T: type, address: u64, value: T) !void {
+        if (self.regionAt(address)) |index| {
+            const region = &self.regions.items[index];
+            const offset: usize = @intCast(address - region.base);
+            if (@sizeOf(T) <= region.bytes.len - offset) {
+                if (!region.permissions.write) return error.AccessDenied;
+                std.mem.writeInt(T, region.bytes[offset..][0..@sizeOf(T)], value, .little);
+                return;
+            }
+        }
         var bytes: [@sizeOf(T)]u8 = undefined;
         std.mem.writeInt(T, &bytes, value, .little);
         try self.write(address, &bytes);
@@ -152,10 +169,11 @@ pub const Memory = struct {
 
     pub fn fetch(self: *const Memory, address: u64) !u32 {
         if (address & 3 != 0) return error.UnalignedInstruction;
-        try self.validate(address, 4, .execute);
-        var bytes: [4]u8 = undefined;
-        self.copyOut(address, &bytes);
-        return std.mem.readInt(u32, &bytes, .little);
+        const region = self.regions.items[self.regionAt(address) orelse return error.MemoryFault];
+        if (!region.permissions.execute) return error.AccessDenied;
+        const offset: usize = @intCast(address - region.base);
+        if (region.bytes.len - offset < 4) return error.MemoryFault;
+        return std.mem.readInt(u32, region.bytes[offset..][0..4], .little);
     }
 };
 

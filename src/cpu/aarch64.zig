@@ -1,4 +1,4 @@
-//! Original AArch64 integer interpreter. Register 31 is resolved per encoding,
+//! AArch64 interpreter. Register 31 is resolved per encoding,
 //! and every W-register write clears the upper half of its X register.
 const std = @import("std");
 const Memory = @import("../memory/address_space.zig").Memory;
@@ -475,6 +475,7 @@ pub const Cpu = struct {
                 0xd53b4200 => @as(u64, self.nzcv) << 28,
                 0xd53b4400 => self.fpcr,
                 0xd53b4420 => self.fpsr,
+                0xd53b0020 => 0x8444c004,
                 0xd53b00e0 => 4, // DCZID_EL0: 64-byte DC ZVA blocks, permitted.
                 else => return error.UnsupportedSystemRegister,
             };
@@ -498,7 +499,8 @@ pub const Cpu = struct {
             self.clearExclusive();
             return .next;
         }
-        if (ins & 0xffffffe0 == 0xd50b7b20 or ins & 0xffffffe0 == 0xd50b7520) return .next;
+        if (ins & 0xffffffe0 == 0xd50b7b20 or ins & 0xffffffe0 == 0xd50b7520 or
+            ins & 0xffffffe0 == 0xd50b7a20 or ins & 0xffffffe0 == 0xd50b7e20) return .next;
         if (ins == 0 or ins == 0xffffffff) return error.UndefinedInstruction;
         return error.UnsupportedInstruction;
     }
@@ -513,6 +515,12 @@ pub const Cpu = struct {
         const a = self.v[rn];
         const b = self.v[rm];
         const old = self.v[rd];
+        if (ins & 0xff80fc00 == 0x5f005400) {
+            const immediate: u7 = @truncate(ins >> 16);
+            if (immediate < 64) return error.UndefinedInstruction;
+            self.v[rd] = @as(u64, @truncate(a)) << @as(u6, @intCast(immediate - 64));
+            return true;
+        }
         const result: ?u128 = switch (logical) {
             0x0e201c00 => a & b,
             0x0e601c00 => a & ~b,
@@ -540,7 +548,10 @@ pub const Cpu = struct {
                 if (lane_bytes != 8) return error.UndefinedInstruction;
                 self.v[rd] = vectorLane(a, index, lane_bytes);
             } else switch (copy) {
-                0x0e000400 => self.v[rd] = replicate(vectorLane(a, index, lane_bytes), lane_bytes, bytes),
+                0x0e000400 => {
+                    if (lane_bytes == 8 and bytes != 16) return error.UndefinedInstruction;
+                    self.v[rd] = replicate(vectorLane(a, index, lane_bytes), lane_bytes, bytes);
+                },
                 0x0e000c00 => {
                     if (index != 0 or lane_bytes > bytes / 2) return error.UndefinedInstruction;
                     self.v[rd] = replicate(self.reg(rn, 64, false), lane_bytes, bytes);
@@ -578,7 +589,7 @@ pub const Cpu = struct {
             const op = ins & 0x20000000 != 0;
             const immediate: u8 = @intCast(((ins >> 16) & 7) << 5 | ((ins >> 5) & 31));
             var expanded: u128 = undefined;
-            if (cmode < 8) expanded = replicate(@as(u64, immediate) << @intCast((cmode >> 1) * 8), 4, bytes) else if (cmode < 12)
+            if (cmode < 8) expanded = replicate(@as(u64, immediate) << (@as(u6, cmode >> 1) * 8), 4, bytes) else if (cmode < 12)
                 expanded = replicate(@as(u64, immediate) << @as(u6, if (cmode & 2 != 0) 8 else 0), 2, bytes)
             else switch (cmode) {
                 12 => expanded = replicate((@as(u64, immediate) << 8) | 255, 4, bytes),
@@ -598,16 +609,14 @@ pub const Cpu = struct {
                 },
                 else => unreachable,
             }
-            if (cmode < 12 and cmode & 1 != 0) self.v[rd] = (if (op) old & ~expanded else old | expanded) & vector_mask else
-                self.v[rd] = (if (op and cmode < 14) ~expanded else expanded) & vector_mask;
+            if (cmode < 12 and cmode & 1 != 0) self.v[rd] = (if (op) old & ~expanded else old | expanded) & vector_mask else self.v[rd] = (if (op and cmode < 14) ~expanded else expanded) & vector_mask;
             return true;
         }
         if (ins & 0xbfe08400 == 0x2e000000) {
             const offset: u4 = @truncate(ins >> 11);
             if (offset >= bytes) return error.UndefinedInstruction;
             const shift: u7 = @as(u7, offset) * 8;
-            self.v[rd] = if (offset == 0) a & vector_mask else
-                ((a >> shift) | (b << @intCast(@as(u8, bytes) * 8 - shift))) & vector_mask;
+            self.v[rd] = if (offset == 0) a & vector_mask else ((a >> shift) | (b << @intCast(@as(u8, bytes) * 8 - shift))) & vector_mask;
             return true;
         }
         if (ins & 0xbf20fc00 == 0x0e208400 or ins & 0xbf20fc00 == 0x2e208400) {
@@ -623,14 +632,61 @@ pub const Cpu = struct {
             self.v[rd] = value;
             return true;
         }
+        const three_same = ins & 0xbf20fc00;
+        if (three_same == 0x0e20bc00 or three_same == 0x0e203400 or three_same == 0x0e203c00 or
+            three_same == 0x2e203400 or three_same == 0x2e203c00 or three_same == 0x0e208c00 or three_same == 0x2e208c00 or
+            ins & 0xbf3ffc00 == 0x0e209800)
+        {
+            const lane_bytes: u8 = @as(u8, 1) << @as(u2, @truncate(ins >> 22));
+            if (lane_bytes == 8 and bytes != 16) return error.UndefinedInstruction;
+            const count = bytes / lane_bytes;
+            var value: u128 = 0;
+            for (0..count) |lane| {
+                var element: u64 = undefined;
+                const first = vectorLane(a, @intCast(lane), lane_bytes);
+                const second = vectorLane(b, @intCast(lane), lane_bytes);
+                if (three_same == 0x0e20bc00) {
+                    const source = if (lane < count / 2) a else b;
+                    const pair: u5 = @intCast((lane % (count / 2)) * 2);
+                    element = vectorLane(source, pair, lane_bytes) +% vectorLane(source, pair + 1, lane_bytes);
+                } else {
+                    const signed_first: i64 = @bitCast(signExtend(first, @intCast(lane_bytes * 8)));
+                    const signed_second: i64 = @bitCast(signExtend(second, @intCast(lane_bytes * 8)));
+                    const matches = switch (three_same) {
+                        0x0e203400 => signed_first > signed_second,
+                        0x0e203c00 => signed_first >= signed_second,
+                        0x2e203400 => first > second,
+                        0x2e203c00 => first >= second,
+                        0x0e208c00 => first & second != 0,
+                        0x2e208c00 => first == second,
+                        else => first == 0,
+                    };
+                    element = if (matches) std.math.maxInt(u64) else 0;
+                }
+                value = replaceLane(value, @intCast(lane), lane_bytes, element);
+            }
+            self.v[rd] = value;
+            return true;
+        }
         if (ins & 0xbf000000 == 0x0c000000) {
             if (ins & 0x00200000 != 0) return error.UndefinedInstruction;
             const post = ins & 0x00800000 != 0;
             if (!post and rm != 0) return error.UndefinedInstruction;
             const load = ins & 0x00400000 != 0;
             const opcode: u4 = @truncate(ins >> 12);
-            const repetitions: u8 = switch (opcode) { 2 => 4, 6 => 3, 10 => 2, 0, 4, 7, 8 => 1, else => return error.UndefinedInstruction };
-            const structures: u8 = switch (opcode) { 0 => 4, 4 => 3, 8 => 2, else => 1 };
+            const repetitions: u8 = switch (opcode) {
+                2 => 4,
+                6 => 3,
+                10 => 2,
+                0, 4, 7, 8 => 1,
+                else => return error.UndefinedInstruction,
+            };
+            const structures: u8 = switch (opcode) {
+                0 => 4,
+                4 => 3,
+                8 => 2,
+                else => 1,
+            };
             const lane_bytes: u8 = @as(u8, 1) << @as(u2, @truncate(ins >> 10));
             if (lane_bytes == 8 and bytes == 8 and structures != 1) return error.UndefinedInstruction;
             const total: u8 = repetitions * structures * bytes;
@@ -644,8 +700,7 @@ pub const Cpu = struct {
                     for (0..structures) |structure| {
                         const register: u5 = @truncate(@as(usize, rd) + iteration * structures + structure);
                         const slot = iteration * structures + structure;
-                        if (load) vectors[slot] = replaceLane(vectors[slot], @intCast(lane), lane_bytes, readLaneBytes(buffer[offset..][0..lane_bytes])) else
-                            writeLaneBytes(buffer[offset..][0..lane_bytes], vectorLane(self.v[register], @intCast(lane), lane_bytes));
+                        if (load) vectors[slot] = replaceLane(vectors[slot], @intCast(lane), lane_bytes, readLaneBytes(buffer[offset..][0..lane_bytes])) else writeLaneBytes(buffer[offset..][0..lane_bytes], vectorLane(self.v[register], @intCast(lane), lane_bytes));
                         offset += lane_bytes;
                     }
                 }
@@ -659,13 +714,360 @@ pub const Cpu = struct {
             if (post) self.setReg(rn, address +% (if (rm == 31) @as(u64, total) else self.reg(rm, 64, false)), 64, true);
             return true;
         }
+        if (ins & 0xbf000000 == 0x0d000000) {
+            const post = ins & 0x00800000 != 0;
+            if (!post and rm != 0) return error.UndefinedInstruction;
+            const load = ins & 0x00400000 != 0;
+            const opcode: u3 = @truncate(ins >> 13);
+            const structures: u8 = @as(u8, opcode & 1) * 2 + @as(u8, @intCast((ins >> 21) & 1)) + 1;
+            const size: u2 = @truncate(ins >> 10);
+            const s: u1 = @truncate(ins >> 12);
+            const q: u1 = @truncate(ins >> 30);
+            var scale: u2 = @intCast(opcode >> 1);
+            var index: u5 = 0;
+            const broadcast = scale == 3;
+            switch (scale) {
+                0 => index = @as(u5, q) * 8 + @as(u5, s) * 4 + size,
+                1 => {
+                    if (size & 1 != 0) return error.UndefinedInstruction;
+                    index = @as(u5, q) * 4 + @as(u5, s) * 2 + (size >> 1);
+                },
+                2 => {
+                    if (size & 2 != 0) return error.UndefinedInstruction;
+                    if (size & 1 != 0) {
+                        if (s != 0) return error.UndefinedInstruction;
+                        scale = 3;
+                        index = q;
+                    } else index = @as(u5, q) * 2 + s;
+                },
+                3 => {
+                    if (!load or s != 0) return error.UndefinedInstruction;
+                    scale = size;
+                },
+            }
+            const lane_bytes: u8 = @as(u8, 1) << scale;
+            const total: u8 = structures * lane_bytes;
+            const address = self.reg(rn, 64, true);
+            var buffer: [32]u8 = undefined;
+            if (load) try memory.read(address, buffer[0..total]);
+            for (0..structures) |structure| {
+                const register: u5 = @truncate(@as(usize, rd) + structure);
+                const lane_buffer = buffer[structure * lane_bytes ..][0..lane_bytes];
+                if (load) {
+                    const element = readLaneBytes(lane_buffer);
+                    self.v[register] = if (broadcast) replicate(element, lane_bytes, bytes) else replaceLane(self.v[register], index, lane_bytes, element);
+                } else writeLaneBytes(lane_buffer, vectorLane(self.v[register], index, lane_bytes));
+            }
+            if (!load) {
+                try memory.write(address, buffer[0..total]);
+                self.clearExclusive();
+            }
+            if (post) self.setReg(rn, address +% (if (rm == 31) @as(u64, total) else self.reg(rm, 64, false)), 64, true);
+            return true;
+        }
+        const fp_conversion = ins & 0x9fbffc00;
+        if (fp_conversion == 0x0e21d800 or fp_conversion == 0x1e21d800 or fp_conversion == 0x0ea1b800 or fp_conversion == 0x1ea1b800) {
+            try self.fpControl();
+            const scalar = ins & 0x10000000 != 0;
+            const double = ins & 0x00400000 != 0;
+            const count: u8 = if (scalar) 1 else bytes / @as(u8, if (double) 8 else 4);
+            if (!scalar and double and bytes == 8) return error.UndefinedInstruction;
+            if (double) self.v[rd] = self.fpVectorConvert(f64, a, ins & 0x00800000 != 0, ins & 0x20000000 != 0, count) else self.v[rd] = self.fpVectorConvert(f32, a, ins & 0x00800000 != 0, ins & 0x20000000 != 0, count);
+            return true;
+        }
         return false;
     }
 
+    fn fpVectorConvert(self: *Cpu, comptime T: type, source: u128, to_integer: bool, unsigned: bool, count: u8) u128 {
+        const width: u7 = @bitSizeOf(T);
+        const lane_bytes: u8 = @sizeOf(T);
+        var result: u128 = 0;
+        for (0..count) |lane| {
+            const bits = vectorLane(source, @intCast(lane), lane_bytes);
+            const value: u64 = if (to_integer) blk: {
+                const input: T = @bitCast(@as(@Int(.unsigned, @bitSizeOf(T)), @truncate(bits)));
+                break :blk self.fpInteger(self.fpInput(T, input), width, 3, unsigned);
+            } else blk: {
+                const number: f128 = if (unsigned) @floatFromInt(bits) else @floatFromInt(@as(i64, @bitCast(signExtend(bits, width))));
+                break :blk floatBits(T, self.fpRound(T, number));
+            };
+            result = replaceLane(result, @intCast(lane), lane_bytes, value);
+        }
+        return result;
+    }
+
     fn floatingPoint(self: *Cpu, ins: u32) !bool {
-        _ = self;
-        _ = ins;
+        if (ins & 0x5f20fc00 == 0x1e200000 or ins & 0x5f200000 == 0x1e000000) {
+            const rd: u5 = @truncate(ins);
+            const rn: u5 = @truncate(ins >> 5);
+            const opcode: u5 = @truncate(ins >> 16);
+            const float_type: u2 = @truncate(ins >> 22);
+            const width: u7 = if (ins >> 31 != 0) 64 else 32;
+            if (ins & 0x00200000 != 0 and (opcode == 6 or opcode == 7 or opcode == 14 or opcode == 15)) {
+                if ((float_type == 0 and width != 32) or (float_type == 1 and width != 64) or float_type == 3 or
+                    (float_type == 2 and (width != 64 or opcode < 14)) or (float_type != 2 and opcode >= 14)) return error.UndefinedInstruction;
+                const upper = opcode >= 14;
+                if (opcode & 1 == 0) self.setReg(rd, @truncate(self.v[rn] >> @as(u7, if (upper) 64 else 0)), width, false) else if (upper)
+                    self.v[rd] = replaceLane(self.v[rd], 1, 8, self.reg(rn, 64, false))
+                else
+                    self.v[rd] = self.reg(rn, width, false);
+                return true;
+            }
+            return switch (float_type) {
+                0 => self.fpConvert(f32, ins, width),
+                1 => self.fpConvert(f64, ins, width),
+                else => error.UnsupportedInstruction,
+            };
+        }
+        if (ins & 0xff000000 == 0x1e000000 or ins & 0xff000000 == 0x1f000000) {
+            return switch (@as(u2, @truncate(ins >> 22))) {
+                0 => self.fpScalar(f32, ins),
+                1 => self.fpScalar(f64, ins),
+                else => error.UnsupportedInstruction,
+            };
+        }
         return false;
+    }
+
+    fn getFloat(self: *const Cpu, comptime T: type, index: u5) T {
+        const Bits = @Int(.unsigned, @bitSizeOf(T));
+        return @bitCast(@as(Bits, @truncate(self.v[index])));
+    }
+
+    fn setFloat(self: *Cpu, comptime T: type, index: u5, value: T) void {
+        const Bits = @Int(.unsigned, @bitSizeOf(T));
+        self.v[index] = @as(Bits, @bitCast(value));
+    }
+
+    fn fpControl(self: *const Cpu) !void {
+        if (self.fpcr & 0x00009f00 != 0) return error.UnsupportedFloatingPointTrap;
+    }
+
+    fn fpInput(self: *Cpu, comptime T: type, value: T) T {
+        const Bits = @Int(.unsigned, @bitSizeOf(T));
+        const bits: Bits = @bitCast(value);
+        const exponent_mask = floatExponentMask(T);
+        if (bits & exponent_mask == 0 and bits & ~floatSignMask(T) != 0 and self.fpcr & 0x01000000 != 0) {
+            self.fpsr |= 128;
+            return @bitCast(bits & floatSignMask(T));
+        }
+        return value;
+    }
+
+    fn fpNaN(self: *Cpu, comptime T: type, operands: []const T) ?T {
+        var first: ?T = null;
+        for (operands) |value| {
+            if (isSignalingNaN(T, value)) {
+                self.fpsr |= 1;
+                return if (self.fpcr & 0x02000000 != 0) defaultNaN(T) else quietNaN(T, value);
+            }
+            if (std.math.isNan(value) and first == null) first = value;
+        }
+        if (first) |value| return if (self.fpcr & 0x02000000 != 0) defaultNaN(T) else quietNaN(T, value);
+        return null;
+    }
+
+    fn fpRound(self: *Cpu, comptime T: type, exact: f128) T {
+        var result: T = @floatCast(exact);
+        const mode: u2 = @truncate(self.fpcr >> 22);
+        if (std.math.isNan(exact)) {
+            self.fpsr |= 1;
+            return defaultNaN(T);
+        }
+        if (mode != 0) {
+            const widened: f128 = result;
+            if ((mode == 1 and widened < exact) or (mode == 3 and exact < 0 and widened < exact)) result = nextFloat(T, result, true);
+            if ((mode == 2 and widened > exact) or (mode == 3 and exact > 0 and widened > exact)) result = nextFloat(T, result, false);
+        }
+        if (std.math.isFinite(exact) and @as(f128, result) != exact) {
+            self.fpsr |= 16;
+            if (std.math.isInf(@as(T, @floatCast(exact)))) self.fpsr |= 4;
+            const bits = floatBits(T, result);
+            if (bits & floatExponentMask(T) == 0) self.fpsr |= 8;
+        }
+        const bits = floatBits(T, result);
+        if (self.fpcr & 0x01000000 != 0 and bits & floatExponentMask(T) == 0 and bits & ~floatSignMask(T) != 0) {
+            self.fpsr |= 8;
+            result = @bitCast(bits & floatSignMask(T));
+        }
+        return result;
+    }
+
+    fn fpCompare(self: *Cpu, comptime T: type, a_raw: T, b_raw: T, signal_quiet_nan: bool) void {
+        const a = self.fpInput(T, a_raw);
+        const b = self.fpInput(T, b_raw);
+        if (std.math.isNan(a) or std.math.isNan(b)) {
+            self.nzcv = 3;
+            if (signal_quiet_nan or isSignalingNaN(T, a) or isSignalingNaN(T, b)) self.fpsr |= 1;
+        } else self.nzcv = if (a == b) 6 else if (a < b) 8 else 2;
+    }
+
+    fn fpScalar(self: *Cpu, comptime T: type, ins: u32) !bool {
+        const rd: u5 = @truncate(ins);
+        const rn: u5 = @truncate(ins >> 5);
+        const rm: u5 = @truncate(ins >> 16);
+        const a_raw = self.getFloat(T, rn);
+        const b_raw = self.getFloat(T, rm);
+        if (ins & 0xff201fe0 == 0x1e201000) {
+            self.v[rd] = expandFloatImmediate(@truncate(ins >> 13), @bitSizeOf(T));
+            return true;
+        }
+        if (ins & 0xff200c00 == 0x1e200c00) {
+            self.v[rd] = if (self.condition(@truncate(ins >> 12))) floatBits(T, a_raw) else floatBits(T, b_raw);
+            return true;
+        }
+        if (ins & 0xff207c00 == 0x1e204000) {
+            const opcode: u6 = @truncate(ins >> 15);
+            switch (opcode) {
+                0 => self.v[rd] = floatBits(T, a_raw),
+                1 => self.v[rd] = floatBits(T, a_raw) & ~floatSignMask(T),
+                2 => self.v[rd] = floatBits(T, a_raw) ^ floatSignMask(T),
+                else => {
+                    try self.fpControl();
+                    if (opcode == 4 and T == f64) {
+                        const input = self.fpInput(T, a_raw);
+                        if (self.fpNaN(T, &.{input})) |nan| {
+                            const sign: u32 = @truncate(floatBits(T, nan) >> 32 & 0x80000000);
+                            const payload: u32 = @truncate(floatBits(T, nan) >> 29 & 0x003fffff);
+                            self.v[rd] = sign | 0x7fc00000 | payload;
+                        } else self.setFloat(f32, rd, self.fpRound(f32, input));
+                    } else if (opcode == 5 and T == f32) {
+                        const input = self.fpInput(T, a_raw);
+                        if (self.fpNaN(T, &.{input})) |nan| {
+                            const sign: u64 = @as(u64, floatBits(T, nan) & 0x80000000) << 32;
+                            const payload: u64 = @as(u64, floatBits(T, nan) & 0x003fffff) << 29;
+                            self.v[rd] = sign | 0x7ff8000000000000 | payload;
+                        } else self.setFloat(f64, rd, input);
+                    } else if (opcode == 3 or (opcode >= 8 and opcode <= 15 and opcode != 13)) {
+                        const a = self.fpInput(T, a_raw);
+                        if (self.fpNaN(T, &.{a})) |nan| self.setFloat(T, rd, nan) else if (opcode == 3) {
+                            const exact = @sqrt(@as(f128, a));
+                            self.setFloat(T, rd, self.fpRound(T, exact));
+                        } else {
+                            const mode: u3 = if (opcode >= 14) @as(u3, @truncate(self.fpcr >> 22)) else @intCast(opcode - 8);
+                            const rounded = roundIntegral(a, mode);
+                            if (opcode == 14 and rounded != a) self.fpsr |= 16;
+                            self.setFloat(T, rd, @floatCast(rounded));
+                        }
+                    } else return error.UnsupportedInstruction;
+                },
+            }
+            return true;
+        }
+        if (ins & 0xff20fc00 == 0x1e202000) {
+            if (ins & 7 != 0 or (ins & 8 != 0 and rm != 0)) return error.UndefinedInstruction;
+            try self.fpControl();
+            self.fpCompare(T, a_raw, if (ins & 8 != 0) 0 else b_raw, ins & 16 != 0);
+            return true;
+        }
+        if (ins & 0xff200c00 == 0x1e200400) {
+            try self.fpControl();
+            if (self.condition(@truncate(ins >> 12))) self.fpCompare(T, a_raw, b_raw, ins & 16 != 0) else self.nzcv = @truncate(ins);
+            return true;
+        }
+        if (ins & 0xff200c00 == 0x1e200800) {
+            const opcode: u4 = @truncate(ins >> 12);
+            if (opcode > 8) return error.UnsupportedInstruction;
+            try self.fpControl();
+            const a = self.fpInput(T, a_raw);
+            const b = self.fpInput(T, b_raw);
+            var value: T = undefined;
+            if ((opcode == 6 or opcode == 7) and !isSignalingNaN(T, a) and !isSignalingNaN(T, b) and (std.math.isNan(a) != std.math.isNan(b))) {
+                value = if (std.math.isNan(a)) b else a;
+            } else if (self.fpNaN(T, &.{ a, b })) |nan| value = nan else if (opcode >= 4 and opcode <= 7) {
+                const minimum = opcode & 1 != 0;
+                if (a == 0 and b == 0) {
+                    const signs = if (minimum) floatBits(T, a) | floatBits(T, b) else floatBits(T, a) & floatBits(T, b);
+                    value = @bitCast(signs & floatSignMask(T));
+                } else value = if ((a < b) == minimum) a else b;
+            } else {
+                const exact: f128 = switch (opcode) {
+                    0 => @as(f128, a) * @as(f128, b),
+                    1 => @as(f128, a) / @as(f128, b),
+                    2 => @as(f128, a) + @as(f128, b),
+                    3 => @as(f128, a) - @as(f128, b),
+                    8 => -(@as(f128, a) * @as(f128, b)),
+                    else => unreachable,
+                };
+                if (opcode == 1 and b == 0 and a != 0 and std.math.isFinite(a)) self.fpsr |= 2;
+                value = self.fpRound(T, exact);
+                if (exact == 0 and (opcode == 2 or opcode == 3)) {
+                    const b_sign = floatBits(T, b) ^ (if (opcode == 3) floatSignMask(T) else 0);
+                    const a_sign = floatBits(T, a);
+                    const negative = if ((a_sign ^ b_sign) & floatSignMask(T) == 0) a_sign & floatSignMask(T) != 0 else self.fpcr & 0x00c00000 == 0x00800000;
+                    value = @bitCast(if (negative) floatSignMask(T) else @as(@Int(.unsigned, @bitSizeOf(T)), 0));
+                }
+            }
+            self.setFloat(T, rd, value);
+            return true;
+        }
+        if (ins & 0xff000000 == 0x1f000000) {
+            try self.fpControl();
+            const ra: u5 = @truncate(ins >> 10);
+            var a = self.fpInput(T, a_raw);
+            const b = self.fpInput(T, b_raw);
+            var c = self.fpInput(T, self.getFloat(T, ra));
+            if (ins & 0x00200000 != 0) c = -c;
+            if ((ins & 0x00200000 != 0) != (ins & 0x00008000 != 0)) a = -a;
+            if (self.fpNaN(T, &.{ c, a, b })) |nan| self.setFloat(T, rd, nan) else {
+                const exact = @mulAdd(f128, a, b, c);
+                var value = self.fpRound(T, exact);
+                if (self.fpcr & 0x00c00000 == 0 and self.fpcr & 0x01000000 == 0 and !std.math.isNan(value)) value = @mulAdd(T, a, b, c);
+                self.setFloat(T, rd, value);
+            }
+            return true;
+        }
+        return false;
+    }
+
+    fn fpConvert(self: *Cpu, comptime T: type, ins: u32, width: u7) !bool {
+        const rd: u5 = @truncate(ins);
+        const rn: u5 = @truncate(ins >> 5);
+        const opcode: u5 = @truncate(ins >> 16);
+        const fixed = ins & 0x00200000 == 0;
+        const fractional_bits: u7 = if (fixed) 64 - @as(u7, @intCast((ins >> 10) & 63)) else 0;
+        if (fixed and fractional_bits > width) return error.UndefinedInstruction;
+        if (fixed and opcode != 2 and opcode != 3 and opcode != 24 and opcode != 25) return error.UndefinedInstruction;
+        try self.fpControl();
+        const scale: f128 = @floatFromInt(@as(u128, 1) << @intCast(fractional_bits));
+        if (opcode == 2 or opcode == 3) {
+            const bits = self.reg(rn, width, false);
+            const number: f128 = if (opcode == 2) @floatFromInt(@as(i64, @bitCast(signExtend(bits, width)))) else @floatFromInt(bits);
+            self.setFloat(T, rd, self.fpRound(T, number / scale));
+        } else {
+            const mode: u3 = switch (opcode & 30) {
+                0 => 0,
+                4 => 4,
+                8 => 1,
+                16 => 2,
+                24 => 3,
+                else => return error.UnsupportedInstruction,
+            };
+            const number = self.fpInput(T, self.getFloat(T, rn));
+            const scaled: f128 = @as(f128, number) * scale;
+            const unsigned = opcode & 1 != 0;
+            self.setReg(rd, self.fpInteger(scaled, width, mode, unsigned), width, false);
+        }
+        return true;
+    }
+
+    fn fpInteger(self: *Cpu, input: f128, width: u7, mode: u3, unsigned: bool) u64 {
+        const rounded = roundIntegral(input, mode);
+        const bound: f128 = @floatFromInt(@as(u128, 1) << @intCast(if (unsigned) width else width - 1));
+        if (std.math.isNan(input)) {
+            self.fpsr |= 1;
+            return 0;
+        }
+        if (rounded >= bound) {
+            self.fpsr |= 1;
+            return if (unsigned) mask(width) else mask(width - 1);
+        }
+        if (rounded < (if (unsigned) @as(f128, 0) else -bound)) {
+            self.fpsr |= 1;
+            return if (unsigned) 0 else @as(u64, 1) << @intCast(width - 1);
+        }
+        if (input != rounded) self.fpsr |= 16;
+        return if (unsigned) @intFromFloat(rounded) else @bitCast(@as(i64, @intFromFloat(rounded)));
     }
 
     fn transfer(self: *Cpu, memory: *Memory, address: u64, rt: u5, size: u2, opc: u2, vector: bool) !void {
@@ -731,6 +1133,58 @@ fn expandFloatImmediate(immediate: u8, width: u7) u64 {
         ((if (bit6 != 0) mask(exponent_bits - 3) else @as(u64, 0)) << 2) | ((immediate >> 4) & 3);
     return (@as(u64, immediate >> 7) << @intCast(width - 1)) | (exponent << fraction_bits) |
         (@as(u64, immediate & 15) << (fraction_bits - 4));
+}
+
+fn floatSignMask(comptime T: type) @Int(.unsigned, @bitSizeOf(T)) {
+    return @as(@Int(.unsigned, @bitSizeOf(T)), 1) << (@bitSizeOf(T) - 1);
+}
+
+fn floatExponentMask(comptime T: type) @Int(.unsigned, @bitSizeOf(T)) {
+    return if (T == f32) 0x7f800000 else 0x7ff0000000000000;
+}
+
+fn floatBits(comptime T: type, value: T) @Int(.unsigned, @bitSizeOf(T)) {
+    return @bitCast(value);
+}
+
+fn defaultNaN(comptime T: type) T {
+    return @bitCast(floatExponentMask(T) | (@as(@Int(.unsigned, @bitSizeOf(T)), 1) << @as(u6, if (T == f32) 22 else 51)));
+}
+
+fn quietNaN(comptime T: type, value: T) T {
+    const quiet = @as(@Int(.unsigned, @bitSizeOf(T)), 1) << @as(u6, if (T == f32) 22 else 51);
+    return @bitCast(floatBits(T, value) | quiet);
+}
+
+fn isSignalingNaN(comptime T: type, value: T) bool {
+    const quiet = @as(@Int(.unsigned, @bitSizeOf(T)), 1) << @as(u6, if (T == f32) 22 else 51);
+    return std.math.isNan(value) and floatBits(T, value) & quiet == 0;
+}
+
+fn nextFloat(comptime T: type, value: T, up: bool) T {
+    const Bits = @Int(.unsigned, @bitSizeOf(T));
+    var bits: Bits = @bitCast(value);
+    if (std.math.isNan(value) or (std.math.isInf(value) and (value > 0) == up)) return value;
+    if (value == 0) return @bitCast(@as(Bits, 1) | (if (up) @as(Bits, 0) else floatSignMask(T)));
+    if ((value > 0) == up) bits += 1 else bits -= 1;
+    return @bitCast(bits);
+}
+
+fn roundIntegral(value: f128, mode: u3) f128 {
+    if (!std.math.isFinite(value) or value == 0) return value;
+    const rounded = switch (mode) {
+        0 => blk: {
+            const lower = @floor(value);
+            const fraction = value - lower;
+            break :blk if (fraction > 0.5 or (fraction == 0.5 and @mod(lower, 2) != 0)) lower + 1 else lower;
+        },
+        1 => @ceil(value),
+        2 => @floor(value),
+        3 => @trunc(value),
+        4 => @round(value),
+        else => unreachable,
+    };
+    return if (rounded == 0 and value < 0) -@as(f128, 0) else rounded;
 }
 
 fn signedImmediate(value: u32, bits: u7) u64 {
@@ -1003,6 +1457,35 @@ test "TLS registers round trip and NZCV is packed at architectural bit positions
     try std.testing.expectEqual(@as(u64, 0xb0000000), cpu.x[2]);
 }
 
+test "Cortex A57 cache geometry and coherent guest cache maintenance" {
+    var memory = try testMemory();
+    defer memory.deinit();
+    var cpu = Cpu.init(0x1000, 0);
+    _ = try executeTest(&cpu, &memory, 0xd53b0028); // MRS X8, CTR_EL0
+    try std.testing.expectEqual(@as(u64, 0x8444c004), cpu.x[8]);
+    try std.testing.expectEqual(@as(u64, 64), @as(u64, 4) << @as(u6, @intCast(cpu.x[8] & 15)));
+    try std.testing.expectEqual(@as(u64, 64), @as(u64, 4) << @as(u6, @intCast((cpu.x[8] >> 16) & 15)));
+    cpu.x[9] = 0x2000;
+    try memory.writeInt(u64, 0x2000, 0x1122334455667788);
+    _ = try executeTest(&cpu, &memory, 0xd50b7e29); // DC CIVAC, X9
+    _ = try executeTest(&cpu, &memory, 0xd50b7a29); // DC CVAC, X9
+    try std.testing.expectEqual(@as(u64, 0x1122334455667788), try memory.readInt(u64, 0x2000));
+    _ = try executeTest(&cpu, &memory, 0xd53b00ea); // MRS X10, DCZID_EL0
+    try std.testing.expectEqual(@as(u64, 4), cpu.x[10]);
+    try memory.writeInt(u8, 0x203f, 0xab);
+    try memory.writeInt(u8, 0x2080, 0xcd);
+    const nonzero: [64]u8 = @splat(0x55);
+    try memory.write(0x2040, &nonzero);
+    cpu.x[9] = 0x2043;
+    _ = try executeTest(&cpu, &memory, 0xd50b7429); // DC ZVA, X9
+    var cleared: [64]u8 = undefined;
+    try memory.read(0x2040, &cleared);
+    const zeros: [64]u8 = @splat(0);
+    try std.testing.expectEqualSlices(u8, &zeros, &cleared);
+    try std.testing.expectEqual(@as(u8, 0xab), try memory.readInt(u8, 0x203f));
+    try std.testing.expectEqual(@as(u8, 0xcd), try memory.readInt(u8, 0x2080));
+}
+
 test "exclusive store success and monitor clearing" {
     var memory = try testMemory();
     defer memory.deinit();
@@ -1081,4 +1564,209 @@ test "load faults and illegal encodings do not advance execution" {
     try std.testing.expectError(error.UndefinedInstruction, executeTest(&cpu, &memory, 0x0bc10000)); // ADD W0, W0, W1, ROR #0
     cpu.pc = 0x1001;
     try std.testing.expectError(error.UnalignedInstruction, cpu.step(&memory));
+}
+
+test "SIMD immediate copies insertions logical operations and lane arithmetic" {
+    var memory = try testMemory();
+    defer memory.deinit();
+    var cpu = Cpu.init(0x1000, 0);
+    _ = try executeTest(&cpu, &memory, 0x4f0747e0); // MOVI V0.4S, #255, LSL #16
+    try std.testing.expectEqual(@as(u128, 0x00ff000000ff000000ff000000ff0000), cpu.v[0]);
+    _ = try executeTest(&cpu, &memory, 0x6f05e540); // MOVI V0.2D, #0xff00ff00ff00ff00
+    try std.testing.expectEqual(@as(u128, 0xff00ff00ff00ff00ff00ff00ff00ff00), cpu.v[0]);
+    cpu.x[1] = 0x12;
+    _ = try executeTest(&cpu, &memory, 0x4e010c20); // DUP V0.16B, W1
+    try std.testing.expectEqual(@as(u128, 0x12121212121212121212121212121212), cpu.v[0]);
+    cpu.v[1] = 0x1234567890abcdef1122334455667788;
+    _ = try executeTest(&cpu, &memory, 0x4e140420); // DUP V0.4S, V1.S[2]
+    try std.testing.expectEqual(@as(u128, 0x90abcdef90abcdef90abcdef90abcdef), cpu.v[0]);
+    cpu.x[1] = 0xffffffffffffffff;
+    _ = try executeTest(&cpu, &memory, 0x4e181c20); // INS V0.D[1], X1
+    try std.testing.expectEqual(@as(u128, 0xffffffffffffffff90abcdef90abcdef), cpu.v[0]);
+    _ = try executeTest(&cpu, &memory, 0x6e146420); // INS V0.S[2], V1.S[3]
+    try std.testing.expectEqual(@as(u128, 0xffffffff1234567890abcdef90abcdef), cpu.v[0]);
+    _ = try executeTest(&cpu, &memory, 0x0e073c20); // UMOV W0, V1.B[3]
+    try std.testing.expectEqual(@as(u64, 0x55), cpu.x[0]);
+    cpu.v[1] = 0xffffffff00000000ffffffff00000000;
+    cpu.v[2] = 0x00000001000000010000000100000001;
+    _ = try executeTest(&cpu, &memory, 0x4ea28420); // ADD V0.4S, V1.4S, V2.4S
+    try std.testing.expectEqual(@as(u128, 0x00000000000000010000000000000001), cpu.v[0]);
+    _ = try executeTest(&cpu, &memory, 0x6e221c20); // EOR V0.16B, V1.16B, V2.16B
+    try std.testing.expectEqual(cpu.v[1] ^ cpu.v[2], cpu.v[0]);
+    _ = try executeTest(&cpu, &memory, 0x2e221c20); // EOR V0.8B, V1.8B, V2.8B
+    try std.testing.expectEqual(@as(u128, 0xfffffffe00000001), cpu.v[0]);
+}
+
+test "SIMD structure loads deinterleave and post-index stores serialize lanes" {
+    var memory = try testMemory();
+    defer memory.deinit();
+    var cpu = Cpu.init(0x1000, 0);
+    cpu.x[1] = 0x2000;
+    for (0..8) |index| try memory.writeInt(u32, 0x2000 + index * 4, @intCast(index + 1));
+    _ = try executeTest(&cpu, &memory, 0x4c408820); // LD2 {V0.4S, V1.4S}, [X1]
+    try std.testing.expectEqual(@as(u128, 0x00000007000000050000000300000001), cpu.v[0]);
+    try std.testing.expectEqual(@as(u128, 0x00000008000000060000000400000002), cpu.v[1]);
+    cpu.x[1] = 0x2100;
+    cpu.x[2] = 32;
+    _ = try executeTest(&cpu, &memory, 0x4c827820); // ST1 {V0.4S}, [X1], X2
+    try std.testing.expectEqual(@as(u64, 0x2120), cpu.x[1]);
+    try std.testing.expectEqual(cpu.v[0], try memory.readInt(u128, 0x2100));
+    cpu.x[1] = 0x2000;
+    _ = try executeTest(&cpu, &memory, 0x4cdfa020); // LD1 {V0.16B, V1.16B}, [X1], #32
+    try std.testing.expectEqual(@as(u64, 0x2020), cpu.x[1]);
+    try std.testing.expectEqual(try memory.readInt(u128, 0x2000), cpu.v[0]);
+    try std.testing.expectEqual(try memory.readInt(u128, 0x2010), cpu.v[1]);
+}
+
+test "scalar floating point raw moves arithmetic conversion and fused operations" {
+    var memory = try testMemory();
+    defer memory.deinit();
+    var cpu = Cpu.init(0x1000, 0);
+    cpu.x[1] = 0x7fc12345;
+    _ = try executeTest(&cpu, &memory, 0x1e270020); // FMOV S0, W1
+    try std.testing.expectEqual(@as(u128, 0x7fc12345), cpu.v[0]);
+    _ = try executeTest(&cpu, &memory, 0x1e260002); // FMOV W2, S0
+    try std.testing.expectEqual(@as(u64, 0x7fc12345), cpu.x[2]);
+    _ = try executeTest(&cpu, &memory, 0x1e2e1000); // FMOV S0, #1
+    try std.testing.expectEqual(@as(f32, 1), cpu.getFloat(f32, 0));
+    cpu.setFloat(f32, 1, 1.5);
+    cpu.setFloat(f32, 2, 2.25);
+    _ = try executeTest(&cpu, &memory, 0x1e222820); // FADD S0, S1, S2
+    try std.testing.expectEqual(@as(f32, 3.75), cpu.getFloat(f32, 0));
+    cpu.setFloat(f64, 1, 7);
+    cpu.setFloat(f64, 2, 2);
+    _ = try executeTest(&cpu, &memory, 0x1e623820); // FSUB D0, D1, D2
+    try std.testing.expectEqual(@as(f64, 5), cpu.getFloat(f64, 0));
+    _ = try executeTest(&cpu, &memory, 0x1e621820); // FDIV D0, D1, D2
+    try std.testing.expectEqual(@as(f64, 3.5), cpu.getFloat(f64, 0));
+    cpu.setFloat(f32, 1, 1.5);
+    _ = try executeTest(&cpu, &memory, 0x1e22c020); // FCVT D0, S1
+    try std.testing.expectEqual(@as(f64, 1.5), cpu.getFloat(f64, 0));
+    cpu.setFloat(f64, 1, -3.5);
+    _ = try executeTest(&cpu, &memory, 0x1e624020); // FCVT S0, D1
+    try std.testing.expectEqual(@as(f32, -3.5), cpu.getFloat(f32, 0));
+    cpu.x[1] = 0xfffffff9;
+    _ = try executeTest(&cpu, &memory, 0x1e220020); // SCVTF S0, W1
+    try std.testing.expectEqual(@as(f32, -7), cpu.getFloat(f32, 0));
+    cpu.setFloat(f32, 1, -2.75);
+    _ = try executeTest(&cpu, &memory, 0x1e380020); // FCVTZS W0, S1
+    try std.testing.expectEqual(@as(u64, 0xfffffffe), cpu.x[0]);
+    cpu.setFloat(f32, 1, 3);
+    cpu.setFloat(f32, 2, 4);
+    cpu.setFloat(f32, 3, 5);
+    _ = try executeTest(&cpu, &memory, 0x1f020c20); // FMADD S0, S1, S2, S3
+    try std.testing.expectEqual(@as(f32, 17), cpu.getFloat(f32, 0));
+    _ = try executeTest(&cpu, &memory, 0x1f028c20); // FMSUB S0, S1, S2, S3
+    try std.testing.expectEqual(@as(f32, -7), cpu.getFloat(f32, 0));
+    _ = try executeTest(&cpu, &memory, 0x1f220c20); // FNMADD S0, S1, S2, S3
+    try std.testing.expectEqual(@as(f32, -17), cpu.getFloat(f32, 0));
+    _ = try executeTest(&cpu, &memory, 0x1f228c20); // FNMSUB S0, S1, S2, S3
+    try std.testing.expectEqual(@as(f32, 7), cpu.getFloat(f32, 0));
+}
+
+test "floating point NaN payloads signed zeros exceptions saturation and directed rounding" {
+    var memory = try testMemory();
+    defer memory.deinit();
+    var cpu = Cpu.init(0x1000, 0);
+    cpu.v[1] = 0x7f812345;
+    cpu.setFloat(f32, 2, 1);
+    _ = try executeTest(&cpu, &memory, 0x1e222820);
+    try std.testing.expectEqual(@as(u128, 0x7fc12345), cpu.v[0]);
+    try std.testing.expectEqual(@as(u32, 1), cpu.fpsr);
+    cpu.fpcr = 0x02000000;
+    _ = try executeTest(&cpu, &memory, 0x1e222820);
+    try std.testing.expectEqual(@as(u128, 0x7fc00000), cpu.v[0]);
+    cpu.fpcr = 0;
+    cpu.fpsr = 0;
+    cpu.setFloat(f32, 1, -@as(f32, 0));
+    cpu.setFloat(f32, 2, 0);
+    _ = try executeTest(&cpu, &memory, 0x1e224820); // FMAX S0, S1, S2
+    try std.testing.expectEqual(@as(u128, 0), cpu.v[0]);
+    _ = try executeTest(&cpu, &memory, 0x1e225820); // FMIN S0, S1, S2
+    try std.testing.expectEqual(@as(u128, 0x80000000), cpu.v[0]);
+    cpu.setFloat(f32, 1, 1);
+    _ = try executeTest(&cpu, &memory, 0x1e221820); // FDIV S0, S1, S2
+    try std.testing.expectEqual(@as(u128, 0x7f800000), cpu.v[0]);
+    try std.testing.expectEqual(@as(u32, 2), cpu.fpsr);
+    cpu.setFloat(f32, 1, std.math.inf(f32));
+    _ = try executeTest(&cpu, &memory, 0x1e380020);
+    try std.testing.expectEqual(@as(u64, 0x7fffffff), cpu.x[0]);
+    try std.testing.expect(cpu.fpsr & 1 != 0);
+    cpu.fpcr = 0x00400000;
+    cpu.setFloat(f32, 1, 1);
+    cpu.setFloat(f32, 2, 0x1p-25);
+    _ = try executeTest(&cpu, &memory, 0x1e222820);
+    try std.testing.expectEqual(@as(u128, 0x3f800001), cpu.v[0]);
+    cpu.fpcr = 0x00800000;
+    cpu.setFloat(f32, 2, -1);
+    _ = try executeTest(&cpu, &memory, 0x1e222820);
+    try std.testing.expectEqual(@as(u128, 0x80000000), cpu.v[0]);
+    cpu.fpcr = 0;
+    cpu.v[1] = 0x7fc01234;
+    _ = try executeTest(&cpu, &memory, 0x1e222020); // FCMP S1, S2
+    try std.testing.expectEqual(@as(u4, 3), cpu.nzcv);
+}
+
+test "SIMD single-lane loads preserve neighbors and broadcasts replace the vector" {
+    var memory = try testMemory();
+    defer memory.deinit();
+    var cpu = Cpu.init(0x1000, 0);
+    cpu.x[1] = 0x2000;
+    cpu.v[0] = std.math.maxInt(u128);
+    try memory.writeInt(u8, 0x2000, 0x12);
+    _ = try executeTest(&cpu, &memory, 0x0d400c20); // LD1 {V0.B}[3], [X1]
+    try std.testing.expectEqual(@as(u128, 0xffffffffffffffffffffffff12ffffff), cpu.v[0]);
+    try memory.writeInt(u32, 0x2000, 0x12345678);
+    _ = try executeTest(&cpu, &memory, 0x4ddfc820); // LD1R {V0.4S}, [X1], #4
+    try std.testing.expectEqual(@as(u128, 0x12345678123456781234567812345678), cpu.v[0]);
+    try std.testing.expectEqual(@as(u64, 0x2004), cpu.x[1]);
+}
+
+test "SIMD scalar and vector integer floating point conversions use lane widths" {
+    var memory = try testMemory();
+    defer memory.deinit();
+    var cpu = Cpu.init(0x1000, 0);
+    cpu.v[1] = 0xfffffff9;
+    _ = try executeTest(&cpu, &memory, 0x5e21d820); // SCVTF S0, S1
+    try std.testing.expectEqual(@as(f32, -7), cpu.getFloat(f32, 0));
+    cpu.setFloat(f64, 1, -2.75);
+    _ = try executeTest(&cpu, &memory, 0x5ee1b820); // FCVTZS D0, D1
+    try std.testing.expectEqual(@as(u128, 0xfffffffffffffffe), cpu.v[0]);
+    cpu.v[1] = 0x0000000400000003fffffffeffffffff;
+    _ = try executeTest(&cpu, &memory, 0x4e21d820); // SCVTF V0.4S, V1.4S
+    try std.testing.expectEqual(@as(u128, 0x4080000040400000c0000000bf800000), cpu.v[0]);
+    cpu.v[1] = cpu.v[0];
+    _ = try executeTest(&cpu, &memory, 0x4ea1b820); // FCVTZS V0.4S, V1.4S
+    try std.testing.expectEqual(@as(u128, 0x0000000400000003fffffffeffffffff), cpu.v[0]);
+}
+
+test "SIMD byte comparisons and pairwise reductions retain pair layout" {
+    var memory = try testMemory();
+    defer memory.deinit();
+    var cpu = Cpu.init(0x1000, 0);
+    cpu.v[1] = 0x00010203000004050006070008000900;
+    cpu.v[0] = 0;
+    _ = try executeTest(&cpu, &memory, 0x6e208c23); // CMEQ V3.16B, V1.16B, V0.16B
+    try std.testing.expectEqual(@as(u128, 0xff000000ffff0000ff0000ff00ff00ff), cpu.v[3]);
+    _ = try executeTest(&cpu, &memory, 0x4e209824); // CMEQ V4.16B, V1.16B, #0
+    try std.testing.expectEqual(cpu.v[3], cpu.v[4]);
+    cpu.v[3] = 0x100f0e0d0c0b0a090807060504030201;
+    cpu.v[4] = 0x201f1e1d1c1b1a191817161514131211;
+    _ = try executeTest(&cpu, &memory, 0x4e24bc66); // ADDP V6.16B, V3.16B, V4.16B
+    try std.testing.expectEqual(@as(u128, 0x3f3b37332f2b27231f1b17130f0b0703), cpu.v[6]);
+}
+
+test "scalar SIMD SHL clears high bits and wraps at the D-register width" {
+    var memory = try testMemory();
+    defer memory.deinit();
+    var cpu = Cpu.init(0x1000, 0);
+    cpu.v[3] = 0xffffffffffffffff123456789abcdef0;
+    _ = try executeTest(&cpu, &memory, 0x5f605463); // SHL D3, D3, #32
+    try std.testing.expectEqual(@as(u128, 0x9abcdef000000000), cpu.v[3]);
+    cpu.v[3] = 0xffffffffffffffff123456789abcdef1;
+    _ = try executeTest(&cpu, &memory, 0x5f405463); // SHL D3, D3, #0
+    try std.testing.expectEqual(@as(u128, 0x123456789abcdef1), cpu.v[3]);
+    _ = try executeTest(&cpu, &memory, 0x5f7f5463); // SHL D3, D3, #63
+    try std.testing.expectEqual(@as(u128, 0x8000000000000000), cpu.v[3]);
+    try std.testing.expectError(error.UndefinedInstruction, executeTest(&cpu, &memory, 0x5f205463));
 }
