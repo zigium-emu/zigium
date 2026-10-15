@@ -287,9 +287,13 @@ pub const Services = struct {
     }
 
     pub fn updateInput(self: *Services, memory: *Memory, buttons: u64, left_x: i32, left_y: i32) !void {
+        return self.updateControllerInput(memory, .{ .buttons = buttons, .left_x = left_x, .left_y = left_y });
+    }
+
+    pub fn updateControllerInput(self: *Services, memory: *Memory, input: legacy_hid.Input) !void {
         const shared = self.hid_shared orelse return;
         self.input_sample +%= 1;
-        try legacy_hid.writeSample(shared.bytes, self.input_sample, self.elapsed_ns, .{ .buttons = buttons, .left_x = left_x, .left_y = left_y });
+        try legacy_hid.writeSample(shared.bytes, self.input_sample, self.elapsed_ns, input);
         try self.syncShared(memory);
     }
 

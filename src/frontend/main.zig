@@ -9,11 +9,12 @@ pub fn main(init: std.process.Init) !void {
         if (comptime build_options.vulkan) return @import("gui.zig").run(init, .{});
         return;
     }
-    if (std.mem.eql(u8, args[1], "--gui") or std.mem.eql(u8, args[1], "--gui-smoke")) {
+    if (std.mem.eql(u8, args[1], "--gui") or std.mem.eql(u8, args[1], "--gui-smoke") or std.mem.eql(u8, args[1], "--gui-input-smoke")) {
         if (comptime build_options.vulkan) {
             var options: @import("gui.zig").Options = .{};
             var cursor: usize = 2;
-            if (std.mem.eql(u8, args[1], "--gui-smoke")) {
+            if (std.mem.eql(u8, args[1], "--gui-smoke") or std.mem.eql(u8, args[1], "--gui-input-smoke")) {
+                options.input_smoke = std.mem.eql(u8, args[1], "--gui-input-smoke");
                 if (cursor >= args.len) return error.InvalidArguments;
                 options.smoke_frames = try std.fmt.parseInt(u32, args[cursor], 10);
                 if (options.smoke_frames.? == 0 or options.smoke_frames.? > 3600) return error.InvalidArguments;
@@ -33,7 +34,7 @@ pub fn main(init: std.process.Init) !void {
         } else return error.VulkanFrontendDisabled;
     }
     if (std.mem.eql(u8, args[1], "--help")) {
-        std.debug.print("Zigium 0.1.0\nUsage: zigium <app.nro|app.nso> [--max-instructions N] [--trace]\n       zigium --gui [app.nro] [--trace]\n       zigium --gui-smoke N [app.nro] [--screenshot output.png]\n       zigium --demo\n       zigium --emit-demo <output.nro>\n", .{});
+        std.debug.print("Zigium 0.1.0\nUsage: zigium <app.nro|app.nso> [--max-instructions N] [--trace]\n       zigium --gui [app.nro] [--trace]\n       zigium --gui-smoke N [app.nro] [--screenshot output.png]\n       zigium --gui-input-smoke N app.nro [--screenshot output.png]\n       zigium --demo\n       zigium --emit-demo <output.nro>\n", .{});
         return;
     }
     if (std.mem.eql(u8, args[1], "--emit-demo")) {

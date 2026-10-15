@@ -14,6 +14,7 @@ pub const Window = struct {
     mouse_x: i32 = 0,
     mouse_y: i32 = 0,
     clicked: bool = false,
+    mouse_held: bool = false,
 
     pub fn init(allocator: std.mem.Allocator) !*Window {
         const self = try allocator.create(Window);
@@ -112,15 +113,33 @@ pub const Window = struct {
                 if (wparam < window.keys.len) window.keys[wparam] = false;
                 return 0;
             },
-            c.WM_KILLFOCUS => @memset(&window.keys, false),
+            c.WM_KILLFOCUS => {
+                @memset(&window.keys, false);
+                window.mouse_held = false;
+                _ = c.ReleaseCapture();
+            },
             c.WM_MOUSEMOVE => {
                 const bits: usize = @bitCast(lparam);
                 window.mouse_x = @as(i16, @bitCast(@as(u16, @truncate(bits))));
                 window.mouse_y = @as(i16, @bitCast(@as(u16, @truncate(bits >> 16))));
                 return 0;
             },
+            c.WM_LBUTTONDOWN => {
+                const bits: usize = @bitCast(lparam);
+                window.mouse_x = @as(i16, @bitCast(@as(u16, @truncate(bits))));
+                window.mouse_y = @as(i16, @bitCast(@as(u16, @truncate(bits >> 16))));
+                window.mouse_held = true;
+                _ = c.SetCapture(handle);
+                return 0;
+            },
             c.WM_LBUTTONUP => {
+                window.mouse_held = false;
+                _ = c.ReleaseCapture();
                 window.clicked = true;
+                return 0;
+            },
+            c.WM_CAPTURECHANGED => {
+                window.mouse_held = false;
                 return 0;
             },
             c.WM_ERASEBKGND => return 1,

@@ -12,6 +12,7 @@ pub const Options = struct {
     smoke_frames: ?u32 = null,
     screenshot: ?[]const u8 = null,
     trace: bool = false,
+    input_smoke: bool = false,
 };
 
 const color = struct {
@@ -107,10 +108,19 @@ const App = struct {
     fn advance(self: *App, window: *const Window) !void {
         const machine = if (self.machine) |*machine| machine else return;
         const input = buttons(window);
-        try machine.kernel.services.updateInput(&machine.memory, input.buttons, input.x, input.y);
+        var controller: zigium.hid.Input = .{ .buttons = input.buttons, .left_x = input.x, .left_y = input.y, .right_x = input.rx, .right_y = input.ry };
+        if (self.guestRect(window.width, window.height)) |rect| {
+            if (window.mouse_held and rect.contains(window.mouse_x, window.mouse_y)) {
+                controller.touch = .{
+                    .x = @intCast(@as(u64, @intCast(window.mouse_x - rect.x)) * 1280 / rect.width),
+                    .y = @intCast(@as(u64, @intCast(window.mouse_y - rect.y)) * 720 / rect.height),
+                };
+            }
+        }
+        try machine.kernel.services.updateControllerInput(&machine.memory, controller);
         machine.kernel.services.signalVsync();
         if (self.status != .running) return;
-        if (try machine.tick(500_000)) {
+        if (try machine.runToFrame(2_000_000)) {
             self.status = .exited;
             std.debug.print("GUI guest exited: {d}; instructions={d}, SVCs={d}\n", .{ machine.kernel.exit_code, machine.instructions, machine.kernel.svc_count });
         }
@@ -152,6 +162,18 @@ const App = struct {
             self.toggle();
             window.clicked = false;
         }
+    }
+
+    fn guestRect(self: *const App, width: u32, height: u32) ?Rect {
+        if (self.guest_pixels.len == 0 or self.guest_width == 0 or self.guest_height == 0) return null;
+        const sidebar: u32 = if (width < 900) 220 else 260;
+        const view: Rect = .{ .x = @intCast(sidebar + 32), .y = 114, .width = width -| (sidebar + 64), .height = height -| 345 };
+        if (view.width == 0 or view.height == 0) return null;
+        const factor = @min(@as(f64, @floatFromInt(view.width)) / @as(f64, @floatFromInt(self.guest_width)), @as(f64, @floatFromInt(view.height)) / @as(f64, @floatFromInt(self.guest_height)));
+        const image_width: u32 = @intFromFloat(@as(f64, @floatFromInt(self.guest_width)) * factor);
+        const image_height: u32 = @intFromFloat(@as(f64, @floatFromInt(self.guest_height)) * factor);
+        if (image_width == 0 or image_height == 0) return null;
+        return .{ .x = view.x + @as(i32, @intCast((view.width - image_width) / 2)), .y = view.y + @as(i32, @intCast((view.height - image_height) / 2)), .width = image_width, .height = image_height };
     }
 
     fn toggle(self: *App) void {
@@ -209,11 +231,8 @@ const App = struct {
         const view: Rect = .{ .x = left, .y = 114, .width = content_width, .height = canvas.height -| 345 };
         canvas.rounded(.{ .x = view.x - 1, .y = view.y - 1, .width = view.width + 2, .height = view.height + 2 }, 13, color.border);
         canvas.rounded(view, 12, color.black);
-        if (self.guest_pixels.len != 0 and self.guest_width != 0) {
-            const factor = @min(@as(f64, @floatFromInt(view.width)) / @as(f64, @floatFromInt(self.guest_width)), @as(f64, @floatFromInt(view.height)) / @as(f64, @floatFromInt(self.guest_height)));
-            const width: u32 = @intFromFloat(@as(f64, @floatFromInt(self.guest_width)) * factor);
-            const height: u32 = @intFromFloat(@as(f64, @floatFromInt(self.guest_height)) * factor);
-            canvas.image(self.guest_pixels, self.guest_width, self.guest_height, .{ .x = view.x + @as(i32, @intCast((view.width - width) / 2)), .y = view.y + @as(i32, @intCast((view.height - height) / 2)), .width = width, .height = height });
+        if (self.guestRect(canvas.width, canvas.height)) |rect| {
+            canvas.image(self.guest_pixels, self.guest_width, self.guest_height, rect);
         } else {
             const cx = view.x + @as(i32, @intCast(view.width / 2));
             const cy = view.y + @as(i32, @intCast(view.height / 2));
@@ -247,7 +266,7 @@ const App = struct {
                 canvas.text(left + 16, diagnostics_y + 83, failure, 1, color.orange);
             } else canvas.text(left + 16, diagnostics_y + 83, "GUEST LOG IS QUIET.", 1, color.muted);
         } else canvas.text(left + 16, diagnostics_y + 48, "F1 HELLO WORLD   /   CTRL+O OPEN HOMEBREW", 1, color.muted);
-        canvas.text(left, @as(i32, @intCast(canvas.height)) - 31, "WASD / ARROWS MOVE   SPACE / X A   Z B   ENTER +   ESC -   F5 PAUSE", 1, color.muted);
+        canvas.text(left, @as(i32, @intCast(canvas.height)) - 31, "WASD MOVE   IJKL AIM   HOLD MOUSE FIRE   SPACE A   Z B   F5 PAUSE", 1, color.muted);
         if (self.guest_fps) |fps| {
             const value = std.fmt.bufPrint(&line, "{d:.1} GUEST FPS", .{fps}) catch "";
             canvas.text(@as(i32, @intCast(canvas.width)) - 140, strip_y + 28, value, 1, color.mint);
@@ -261,7 +280,7 @@ fn clock() i64 {
     return value.QuadPart;
 }
 
-const Input = struct { buttons: u64, x: i32, y: i32 };
+const Input = struct { buttons: u64, x: i32, y: i32, rx: i32 = 0, ry: i32 = 0 };
 fn buttons(window: *const Window) Input {
     var input: Input = .{ .buttons = 0, .x = 0, .y = 0 };
     if (window.keys['X'] or window.keys[c.VK_SPACE]) input.buttons |= 1;
@@ -276,8 +295,208 @@ fn buttons(window: *const Window) Input {
     if (window.keys['D'] or window.keys[c.VK_RIGHT]) input.x += 32767;
     if (window.keys['W'] or window.keys[c.VK_UP]) input.y += 32767;
     if (window.keys['S'] or window.keys[c.VK_DOWN]) input.y -= 32767;
+    if (window.keys['J']) input.rx -= 32767;
+    if (window.keys['L']) input.rx += 32767;
+    if (window.keys['I']) input.ry += 32767;
+    if (window.keys['K']) input.ry -= 32767;
     return input;
 }
+
+const InputProbe = struct {
+    const Stage = enum { title, focus, start, move, prime, neutral, fire, touch, sustained, done };
+    stage: Stage = .title,
+    held_key: ?u8 = null,
+    held_secondary: ?u8 = null,
+    held_mouse: bool = false,
+    started: i64,
+    stage_tick: i64 = 0,
+    previous_sequence: u64 = 0,
+    previous_hash: u64 = 0,
+    gameplay_tick: i64 = 0,
+    gameplay_sequence: u64 = 0,
+    key_seen: bool = false,
+
+    fn release(self: *InputProbe) void {
+        if (self.held_key) |key| c.keybd_event(key, 0, c.KEYEVENTF_KEYUP, 0);
+        if (self.held_secondary) |key| c.keybd_event(key, 0, c.KEYEVENTF_KEYUP, 0);
+        if (self.held_mouse) c.mouse_event(c.MOUSEEVENTF_LEFTUP, 0, 0, 0, 0);
+        self.held_key = null;
+        self.held_secondary = null;
+        self.held_mouse = false;
+    }
+
+    fn press(self: *InputProbe, window: *Window, key: u8) !void {
+        if (c.GetForegroundWindow() != window.handle) return error.InputSmokeNoForeground;
+        self.release();
+        self.held_key = key;
+        self.key_seen = false;
+        c.keybd_event(key, 0, 0, 0);
+        std.debug.print("Input smoke OS key down: 0x{x}; foreground HWND=0x{x}\n", .{ key, @intFromPtr(window.handle) });
+    }
+
+    fn pressPair(self: *InputProbe, window: *Window, first: u8, second: u8) !void {
+        try self.press(window, first);
+        if (c.GetForegroundWindow() != window.handle) return error.InputSmokeNoForeground;
+        self.held_secondary = second;
+        c.keybd_event(second, 0, 0, 0);
+        std.debug.print("Input smoke OS key down: 0x{x}; foreground HWND=0x{x}\n", .{ second, @intFromPtr(window.handle) });
+    }
+
+    fn focus(window: *Window) !void {
+        _ = c.BringWindowToTop(window.handle);
+        _ = c.SetForegroundWindow(window.handle);
+        _ = c.SetFocus(window.handle);
+        if (c.GetForegroundWindow() == window.handle) return;
+        const sidebar: i32 = if (window.width < 900) 220 else 260;
+        var point: c.POINT = .{
+            .x = sidebar + 32 + @as(i32, @intCast((window.width -| @as(u32, @intCast(sidebar + 64))) / 2)),
+            .y = 114 + @as(i32, @intCast((window.height -| 345) / 2)),
+        };
+        if (c.ClientToScreen(window.handle, &point) == 0) return error.InputSmokeScreenPoint;
+        if (c.WindowFromPoint(point) != window.handle) return error.InputSmokeWindowObscured;
+        if (c.SetCursorPos(point.x, point.y) == 0) return error.InputSmokeCursor;
+        if (c.WindowFromPoint(point) != window.handle) return error.InputSmokeWindowObscured;
+        c.mouse_event(c.MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0);
+        c.mouse_event(c.MOUSEEVENTF_LEFTUP, 0, 0, 0, 0);
+        std.debug.print("Input smoke OS click: screen ({d}, {d}); verified HWND=0x{x}\n", .{ point.x, point.y, @intFromPtr(window.handle) });
+    }
+
+    fn pressTouch(self: *InputProbe, app: *const App, window: *Window) !void {
+        if (c.GetForegroundWindow() != window.handle) return error.InputSmokeNoForeground;
+        self.release();
+        const rect = app.guestRect(window.width, window.height) orelse return error.InputSmokeNoViewport;
+        var point: c.POINT = .{ .x = rect.x + @as(i32, @intCast(rect.width * 3 / 4)), .y = rect.y + @as(i32, @intCast(rect.height / 4)) };
+        if (c.ClientToScreen(window.handle, &point) == 0) return error.InputSmokeScreenPoint;
+        if (c.WindowFromPoint(point) != window.handle) return error.InputSmokeWindowObscured;
+        if (c.SetCursorPos(point.x, point.y) == 0) return error.InputSmokeCursor;
+        if (c.WindowFromPoint(point) != window.handle) return error.InputSmokeWindowObscured;
+        self.held_mouse = true;
+        self.key_seen = false;
+        c.mouse_event(c.MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0);
+        std.debug.print("Input smoke OS touch hold: screen ({d}, {d}); verified HWND=0x{x}\n", .{ point.x, point.y, @intFromPtr(window.handle) });
+    }
+
+    fn capture(app: *const App, renderer: *Renderer, prefix: []const u8, label: []const u8) !void {
+        const base = if (std.mem.endsWith(u8, prefix, ".png")) prefix[0 .. prefix.len - 4] else prefix;
+        const path = try std.fmt.allocPrint(app.allocator, "{s}-{s}.png", .{ base, label });
+        defer app.allocator.free(path);
+        const pixels = try renderer.readback(app.allocator);
+        defer app.allocator.free(pixels);
+        try drawing.writePng(app.io, app.allocator, path, pixels, renderer.width, renderer.height);
+        std.debug.print("Input smoke GPU capture: {s}; guest sequence={d}\n", .{ path, app.frame_sequence });
+    }
+
+    fn advance(self: *InputProbe, app: *App, window: *Window, renderer: *Renderer, prefix: []const u8) !void {
+        const now = clock();
+        if (now - self.started > app.clock_frequency * 50) return error.InputSmokeTimeout;
+        if (app.status == .stopped or app.status == .exited) {
+            self.release();
+            try capture(app, renderer, prefix, "stopped");
+            return error.InputSmokeGuestStopped;
+        }
+        if (self.held_key) |key| {
+            if (c.GetForegroundWindow() != window.handle) return error.InputSmokeFocusLost;
+            if (!self.key_seen and window.keys[key] and (if (self.held_secondary) |second| window.keys[second] else true)) {
+                self.key_seen = true;
+                std.debug.print("Input smoke window received OS key: 0x{x}\n", .{key});
+                if (self.held_secondary) |second| std.debug.print("Input smoke window received OS key: 0x{x}\n", .{second});
+            }
+            if (!self.key_seen and now - self.stage_tick > app.clock_frequency) return error.InputSmokeKeyNotReceived;
+        }
+        if (self.held_mouse) {
+            if (c.GetForegroundWindow() != window.handle) return error.InputSmokeFocusLost;
+            if (!self.key_seen and window.mouse_held) {
+                self.key_seen = true;
+                std.debug.print("Input smoke window received OS mouse hold\n", .{});
+            }
+            if (!self.key_seen and now - self.stage_tick > app.clock_frequency) return error.InputSmokeMouseNotReceived;
+        }
+        if (app.guest_pixels.len == 0) return;
+        var nonblack = false;
+        for (app.guest_pixels) |pixel| {
+            if (pixel & 0x00ffffff != 0) {
+                nonblack = true;
+                break;
+            }
+        }
+        if (!nonblack) return;
+        const hash = std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(app.guest_pixels));
+        const changed = app.frame_sequence > self.previous_sequence and hash != self.previous_hash;
+        switch (self.stage) {
+            .title => if (app.frame_sequence >= 5) {
+                try capture(app, renderer, prefix, "title");
+                self.previous_sequence = app.frame_sequence;
+                self.previous_hash = hash;
+                try focus(window);
+                self.stage_tick = now;
+                self.stage = .focus;
+            },
+            .focus => {
+                if (c.GetForegroundWindow() != window.handle) {
+                    if (now - self.stage_tick > app.clock_frequency) return error.InputSmokeNoForeground;
+                    return;
+                }
+                try self.press(window, c.VK_SPACE);
+                self.stage_tick = now;
+                self.stage = .start;
+            },
+            .start => if (changed and now - self.stage_tick > @divTrunc(app.clock_frequency, 4)) {
+                self.release();
+                try capture(app, renderer, prefix, "gameplay");
+                self.gameplay_tick = now;
+                self.gameplay_sequence = app.frame_sequence;
+                self.previous_sequence = app.frame_sequence;
+                self.previous_hash = hash;
+                try self.press(window, 'D');
+                self.stage_tick = now;
+                self.stage = .move;
+            },
+            .move => if (changed and now - self.stage_tick >= app.clock_frequency) {
+                self.release();
+                try capture(app, renderer, prefix, "movement");
+                self.previous_sequence = app.frame_sequence;
+                self.previous_hash = hash;
+                try self.pressPair(window, 'I', 'L');
+                self.stage_tick = now;
+                self.stage = .prime;
+            },
+            .prime => if (self.key_seen and app.frame_sequence >= self.previous_sequence + 2) {
+                self.release();
+                self.previous_sequence = app.frame_sequence;
+                self.stage_tick = now;
+                self.stage = .neutral;
+            },
+            .neutral => if (!window.keys['I'] and !window.keys['L'] and app.frame_sequence >= self.previous_sequence + 2) {
+                try self.pressPair(window, 'I', 'L');
+                self.previous_sequence = app.frame_sequence;
+                self.stage_tick = now;
+                self.stage = .fire;
+            },
+            .fire => if (self.key_seen and app.frame_sequence >= self.previous_sequence + 2) {
+                self.release();
+                try capture(app, renderer, prefix, "stick-fire");
+                try self.pressTouch(app, window);
+                self.previous_sequence = app.frame_sequence;
+                self.stage_tick = now;
+                self.stage = .touch;
+            },
+            .touch => if (self.key_seen and app.frame_sequence >= self.previous_sequence + 8) {
+                try capture(app, renderer, prefix, "touch-fire");
+                self.release();
+                self.stage_tick = now;
+                self.previous_sequence = app.frame_sequence;
+                self.stage = .sustained;
+            },
+            .sustained => if (app.frame_sequence >= self.previous_sequence + 2 and now - self.gameplay_tick >= app.clock_frequency * 3 and app.frame_sequence - self.gameplay_sequence >= 3) {
+                const seconds = @as(f64, @floatFromInt(now - self.gameplay_tick)) / @as(f64, @floatFromInt(app.clock_frequency));
+                const frames = app.frame_sequence - self.gameplay_sequence;
+                std.debug.print("Input smoke gameplay sample: {d} queued frames in {d:.3} seconds, {d:.3} FPS\n", .{ frames, seconds, @as(f64, @floatFromInt(frames)) / seconds });
+                self.stage = .done;
+            },
+            .done => {},
+        }
+    }
+};
 
 pub fn run(init: std.process.Init, options: Options) !void {
     const allocator = init.gpa;
@@ -291,6 +510,8 @@ pub fn run(init: std.process.Init, options: Options) !void {
     if (c.QueryPerformanceFrequency(&frequency) == 0 or frequency.QuadPart <= 0) return error.HostClock;
     var app: App = .{ .allocator = allocator, .io = init.io, .trace = options.trace, .clock_frequency = frequency.QuadPart };
     defer app.deinit();
+    var input_probe: InputProbe = .{ .started = clock() };
+    defer input_probe.release();
     try app.library.append(allocator, .{ .path = null, .title = try allocator.dupe(u8, "HELLO WORLD") });
     if (options.path) |path| {
         const index = try app.addFile(path);
@@ -322,9 +543,14 @@ pub fn run(init: std.process.Init, options: Options) !void {
         app.advance(window) catch |err| app.stop(err);
         app.draw(&canvas, window, &renderer);
         try renderer.present(canvas.pixels, canvas.width, canvas.height);
+        if (options.input_smoke) {
+            try input_probe.advance(&app, window, &renderer, options.screenshot orelse "zigium-input-smoke.png");
+            if (input_probe.stage == .done) break;
+        }
         window.endFrame();
         if (options.smoke_frames) |count| if (renderer.frames >= count) break;
     }
+    if (options.input_smoke and input_probe.stage != .done) return error.InputSmokeIncomplete;
     if (options.screenshot) |path| {
         const pixels = try renderer.readback(allocator);
         defer allocator.free(pixels);

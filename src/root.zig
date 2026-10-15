@@ -9,6 +9,7 @@ pub const nso = @import("loader/nso.zig");
 pub const homebrew = @import("loader/homebrew.zig");
 pub const demo = @import("loader/demo.zig");
 pub const framebuffer = @import("gpu/framebuffer.zig");
+pub const hid = @import("input/hid.zig");
 
 pub const Machine = struct {
     memory: Memory,
@@ -44,6 +45,15 @@ pub const Machine = struct {
     }
 
     pub fn tick(self: *Machine, instruction_budget: u64) !bool {
+        return self.executeSlice(instruction_budget, false);
+    }
+
+    pub fn runToFrame(self: *Machine, instruction_budget: u64) !bool {
+        return self.executeSlice(instruction_budget, true);
+    }
+
+    fn executeSlice(self: *Machine, instruction_budget: u64, stop_on_frame: bool) !bool {
+        const initial_frame = self.kernel.services.frame_sequence;
         self.kernel.pollWaiters();
         if (self.blocked) {
             self.kernel.scheduler.activateReady(&self.cpu) catch return false;
@@ -62,6 +72,7 @@ pub const Machine = struct {
                 self.blocked = true;
                 return false;
             };
+            if (stop_on_frame and self.kernel.services.frame_sequence != initial_frame) break;
         }
         return self.halted;
     }
